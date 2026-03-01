@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Basketball scoreboard OCR bridge for RoboWhisperer/BasketballScoreboard.
+"""GUI-first Basketball scoreboard OCR app.
 
-Reads frames from an image, video file, or camera, OCRs configured regions, and
-POSTs merged state updates to the Scorebug API (/api/state).
+This module provides a desktop app that lets users configure source/API/ROIs and
+run OCR without command-line usage.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
 import sys
+import threading
 import time
+import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from tkinter import filedialog, messagebox, ttk
+from typing import Any, Callable, Dict, Optional
 from urllib import error, request
 
 import cv2  # type: ignore
@@ -37,37 +39,60 @@ DEFAULT_ROIS: Dict[str, list[float]] = {
     "awayTimeouts": [0.74, 0.90, 0.08, 0.05],
 }
 
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
 
 @dataclass
 class OCRField:
-    key: str
     whitelist: str
     psm: int = 7
 
 
-OCR_FIELDS = {
-    "homeScore": OCRField("homeScore", "0123456789", 8),
-    "awayScore": OCRField("awayScore", "0123456789", 8),
-    "gameClock": OCRField("gameClock", "0123456789:", 7),
-    "shotClock": OCRField("shotClock", "0123456789", 8),
-    "period": OCRField("period", "QOT123456789", 8),
-    "homeFouls": OCRField("homeFouls", "0123456789", 8),
-    "awayFouls": OCRField("awayFouls", "0123456789", 8),
-    "homeTimeouts": OCRField("homeTimeouts", "0123456789", 8),
-    "awayTimeouts": OCRField("awayTimeouts", "0123456789", 8),
+OCR_FIELDS: Dict[str, OCRField] = {
+    "homeScore": OCRField("0123456789", 8),
+    "awayScore": OCRField("0123456789", 8),
+    "gameClock": OCRField("0123456789:", 7),
+    "shotClock": OCRField("0123456789", 8),
+    "period": OCRField("QOT123456789", 8),
+    "homeFouls": OCRField("0123456789", 8),
+    "awayFouls": OCRField("0123456789", 8),
+    "homeTimeouts": OCRField("0123456789", 8),
+    "awayTimeouts": OCRField("0123456789", 8),
 }
 
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
-
-
-def load_config(path: Optional[Path]) -> Dict[str, Any]:
-    if not path or not path.exists():
+def load_config(path: Path) -> Dict[str, Any]:
+    if not path.exists():
         return {"rois": DEFAULT_ROIS}
     with path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    cfg.setdefault("rois", DEFAULT_ROIS)
-    return cfg
+        data = json.load(f)
+    data.setdefault("rois", DEFAULT_ROIS)
+    return data
+
+
+def save_config(path: Path, rois: Dict[str, list[float]]) -> None:
+    path.write_text(json.dumps({"rois": rois}, indent=2) + "\n", encoding="utf-8")
+
+
+def create_capture(source: str) -> cv2.VideoCapture:
+    if source.isdigit():
+        return cv2.VideoCapture(int(source))
+    return cv2.VideoCapture(source)
+
+
+def read_sample_frame(source: str) -> Optional[np.ndarray]:
+    path = Path(source)
+    if path.exists() and path.suffix.lower() in IMAGE_SUFFIXES:
+        return cv2.imread(str(path))
+
+    cap = create_capture(source)
+    if not cap.isOpened():
+        return None
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return None
+    return frame
 
 
 def roi_pixels(frame: np.ndarray, roi_norm: list[float]) -> np.ndarray:
@@ -87,8 +112,8 @@ def preprocess(roi: np.ndarray) -> np.ndarray:
 
 
 def ocr_text(img: np.ndarray, field: OCRField) -> str:
-    config = f"--oem 3 --psm {field.psm} -c tessedit_char_whitelist={field.whitelist}"
-    text = pytesseract.image_to_string(img, config=config)
+    cfg = f"--oem 3 --psm {field.psm} -c tessedit_char_whitelist={field.whitelist}"
+    text = pytesseract.image_to_string(img, config=cfg)
     return re.sub(r"\s+", "", text).upper()
 
 
@@ -103,20 +128,19 @@ def parse_clock(text: str) -> Optional[str]:
     return f"{mm}:{ss:02d}"
 
 
-def parse_int(text: str, min_v: int = 0, max_v: int = 999) -> Optional[int]:
+def parse_int(text: str, low: int, high: int) -> Optional[int]:
     m = re.search(r"\d+", text)
     if not m:
         return None
-    value = int(m.group(0))
-    if value < min_v or value > max_v:
+    val = int(m.group(0))
+    if val < low or val > high:
         return None
-    return value
+    return val
 
 
 def parse_period(text: str) -> Optional[str]:
     t = text.replace("0", "O")
-    valid = {"Q1", "Q2", "Q3", "Q4", "OT", "2OT"}
-    if t in valid:
+    if t in {"Q1", "Q2", "Q3", "Q4", "OT", "2OT"}:
         return t
     if t in {"1", "2", "3", "4"}:
         return f"Q{t}"
@@ -130,12 +154,13 @@ def parse_period(text: str) -> Optional[str]:
 def extract_state(frame: np.ndarray, rois: Dict[str, list[float]]) -> Dict[str, Any]:
     state: Dict[str, Any] = {}
     for key, roi_norm in rois.items():
-        if key not in OCR_FIELDS:
+        field = OCR_FIELDS.get(key)
+        if field is None:
             continue
         roi = roi_pixels(frame, roi_norm)
         if roi.size == 0:
             continue
-        text = ocr_text(preprocess(roi), OCR_FIELDS[key])
+        text = ocr_text(preprocess(roi), field)
         if key in {"homeScore", "awayScore"}:
             val = parse_int(text, 0, 300)
         elif key in {"homeFouls", "awayFouls"}:
@@ -150,7 +175,6 @@ def extract_state(frame: np.ndarray, rois: Dict[str, list[float]]) -> Dict[str, 
             val = parse_period(text)
         else:
             val = None
-
         if val is not None:
             state[key] = val
     return state
@@ -166,131 +190,269 @@ def post_json(url: str, payload: Dict[str, Any], timeout: float) -> None:
         return
 
 
-def create_capture(source: str) -> cv2.VideoCapture:
-    if source.isdigit():
-        return cv2.VideoCapture(int(source))
-    return cv2.VideoCapture(source)
+class OCRRunner:
+    def __init__(
+        self,
+        source: str,
+        api_url: str,
+        rois: Dict[str, list[float]],
+        interval: float,
+        http_timeout: float,
+        on_update: Callable[[Dict[str, Any]], None],
+        on_status: Callable[[str], None],
+    ) -> None:
+        self.source = source
+        self.api_url = api_url
+        self.rois = rois
+        self.interval = interval
+        self.http_timeout = http_timeout
+        self.on_update = on_update
+        self.on_status = on_status
+
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        source_path = Path(self.source)
+        is_image = source_path.exists() and source_path.suffix.lower() in IMAGE_SUFFIXES
+
+        if is_image:
+            frame = cv2.imread(str(source_path))
+            if frame is None:
+                self.on_status("Failed to read image source.")
+                return
+            self._process_frame(frame, {})
+            self.on_status("Processed single image.")
+            return
+
+        cap = create_capture(self.source)
+        if not cap.isOpened():
+            self.on_status(f"Unable to open source: {self.source}")
+            return
+
+        last_sent: Dict[str, Any] = {}
+        self.on_status("OCR running...")
+        next_run = 0.0
+        try:
+            while not self.stop_event.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    time.sleep(0.05)
+                    continue
+                now = time.time()
+                if now < next_run:
+                    continue
+                next_run = now + self.interval
+                self._process_frame(frame, last_sent)
+        finally:
+            cap.release()
+            self.on_status("OCR stopped.")
+
+    def _process_frame(self, frame: np.ndarray, last_sent: Dict[str, Any]) -> None:
+        extracted = extract_state(frame, self.rois)
+        changed = {k: v for k, v in extracted.items() if last_sent.get(k) != v}
+        if changed:
+            last_sent.update(changed)
+            post_json(self.api_url, changed, self.http_timeout)
+            self.on_update(changed)
 
 
-def should_push(new_state: Dict[str, Any], old_state: Dict[str, Any]) -> Dict[str, Any]:
-    changed = {k: v for k, v in new_state.items() if old_state.get(k) != v}
-    old_state.update(changed)
-    return changed
+class ScoreboardOCRApp:
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title("Scoreboard OCR - GUI")
+        self.root.geometry("760x560")
 
+        self.config_path = Path("config.example.json")
+        self.rois: Dict[str, list[float]] = DEFAULT_ROIS.copy()
+        self.runner: Optional[OCRRunner] = None
 
-def read_sample_frame(source: str) -> Optional[np.ndarray]:
-    source_path = Path(source)
-    if source_path.exists() and source_path.suffix.lower() in IMAGE_SUFFIXES:
-        return cv2.imread(str(source_path))
+        self.source_var = tk.StringVar(value="0")
+        self.api_var = tk.StringVar(value="http://localhost:3000/api/state")
+        self.interval_var = tk.StringVar(value="0.15")
+        self.timeout_var = tk.StringVar(value="0.25")
+        self.config_var = tk.StringVar(value=str(self.config_path))
+        self.status_var = tk.StringVar(value="Ready")
 
-    cap = create_capture(source)
-    if not cap.isOpened():
-        return None
-    ok, frame = cap.read()
-    cap.release()
-    if not ok:
-        return None
-    return frame
+        self._build_ui()
+        self._load_config_if_exists()
 
+    def _build_ui(self) -> None:
+        pad = {"padx": 10, "pady": 6}
 
-def run_roi_gui(source: str, output_path: Path, rois: Dict[str, list[float]]) -> int:
-    frame = read_sample_frame(source)
-    if frame is None:
-        print(f"Unable to open source for ROI selection: {source}", file=sys.stderr)
-        return 2
+        frm = ttk.Frame(self.root)
+        frm.pack(fill="both", expand=True)
 
-    temp_image = output_path.parent / ".roi_selector_frame.png"
-    cv2.imwrite(str(temp_image), frame)
-    try:
-        launch_roi_selector(temp_image, output_path, initial_rois=rois)
-    except Exception as exc:
-        print(f"Failed to launch ROI GUI: {exc}", file=sys.stderr)
-        return 4
-    finally:
-        if temp_image.exists():
-            temp_image.unlink()
-    return 0
+        ttk.Label(frm, text="Video/Image Source (camera index, file path, or URL):").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.source_var, width=62).grid(row=1, column=0, sticky="we", **pad)
+        ttk.Button(frm, text="Browse File", command=self._browse_source).grid(row=1, column=1, sticky="e", **pad)
+
+        ttk.Label(frm, text="BasketballScoreboard API URL:").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.api_var, width=62).grid(row=3, column=0, columnspan=2, sticky="we", **pad)
+
+        opts = ttk.Frame(frm)
+        opts.grid(row=4, column=0, columnspan=2, sticky="we", **pad)
+        ttk.Label(opts, text="OCR Interval (sec):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(opts, textvariable=self.interval_var, width=10).grid(row=0, column=1, padx=(6, 20))
+        ttk.Label(opts, text="HTTP Timeout (sec):").grid(row=0, column=2, sticky="w")
+        ttk.Entry(opts, textvariable=self.timeout_var, width=10).grid(row=0, column=3, padx=(6, 0))
+
+        cfg = ttk.LabelFrame(frm, text="ROI Configuration")
+        cfg.grid(row=5, column=0, columnspan=2, sticky="we", **pad)
+        ttk.Entry(cfg, textvariable=self.config_var, width=58).grid(row=0, column=0, sticky="we", padx=8, pady=8)
+        ttk.Button(cfg, text="Browse", command=self._browse_config).grid(row=0, column=1, padx=6)
+        ttk.Button(cfg, text="Load", command=self._load_config).grid(row=0, column=2, padx=6)
+        ttk.Button(cfg, text="Save", command=self._save_config).grid(row=0, column=3, padx=6)
+        ttk.Button(cfg, text="Edit ROIs", command=self._edit_rois).grid(row=0, column=4, padx=6)
+
+        controls = ttk.Frame(frm)
+        controls.grid(row=6, column=0, columnspan=2, sticky="we", **pad)
+        ttk.Button(controls, text="Start OCR", command=self._start).pack(side="left", padx=6)
+        ttk.Button(controls, text="Stop OCR", command=self._stop).pack(side="left", padx=6)
+
+        output = ttk.LabelFrame(frm, text="Live Updates")
+        output.grid(row=7, column=0, columnspan=2, sticky="nsew", **pad)
+        self.log = tk.Text(output, height=14, wrap="word")
+        self.log.pack(fill="both", expand=True, padx=8, pady=8)
+
+        ttk.Label(frm, textvariable=self.status_var).grid(row=8, column=0, columnspan=2, sticky="w", **pad)
+
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(7, weight=1)
+
+    def _append_log(self, message: str) -> None:
+        self.log.insert("end", message + "\n")
+        self.log.see("end")
+
+    def _set_status(self, message: str) -> None:
+        self.root.after(0, lambda: self.status_var.set(message))
+
+    def _on_update(self, changed: Dict[str, Any]) -> None:
+        self.root.after(0, lambda: self._append_log(json.dumps(changed)))
+
+    def _load_config_if_exists(self) -> None:
+        if Path(self.config_var.get()).exists():
+            self._load_config()
+
+    def _browse_source(self) -> None:
+        path = filedialog.askopenfilename(title="Choose video/image source")
+        if path:
+            self.source_var.set(path)
+
+    def _browse_config(self) -> None:
+        path = filedialog.askopenfilename(title="Choose ROI config JSON", filetypes=[("JSON files", "*.json")])
+        if path:
+            self.config_var.set(path)
+
+    def _load_config(self) -> None:
+        try:
+            cfg = load_config(Path(self.config_var.get()))
+            self.rois = cfg.get("rois", DEFAULT_ROIS)
+            self._set_status(f"Loaded ROI config: {self.config_var.get()}")
+        except Exception as exc:
+            messagebox.showerror("Config Error", f"Could not load config:\n{exc}")
+
+    def _save_config(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Save ROI config",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            initialfile=Path(self.config_var.get()).name,
+        )
+        if not path:
+            return
+        try:
+            save_config(Path(path), self.rois)
+            self.config_var.set(path)
+            self._set_status(f"Saved ROI config: {path}")
+        except Exception as exc:
+            messagebox.showerror("Save Error", f"Could not save config:\n{exc}")
+
+    def _edit_rois(self) -> None:
+        frame = read_sample_frame(self.source_var.get())
+        if frame is None:
+            messagebox.showerror("Source Error", "Could not read a frame from the selected source.")
+            return
+
+        temp = Path(".roi_editor_sample.png")
+        cv2.imwrite(str(temp), frame)
+        out_path = Path(self.config_var.get())
+        try:
+            launch_roi_selector(temp, out_path, self.rois)
+            if out_path.exists():
+                self.rois = load_config(out_path).get("rois", DEFAULT_ROIS)
+                self._set_status(f"ROI updated: {out_path}")
+        except Exception as exc:
+            messagebox.showerror("ROI GUI Error", f"Failed to open ROI editor:\n{exc}")
+        finally:
+            if temp.exists():
+                temp.unlink()
+
+    def _start(self) -> None:
+        if self.runner is not None:
+            messagebox.showinfo("OCR", "OCR is already running.")
+            return
+
+        try:
+            interval = float(self.interval_var.get())
+            timeout = float(self.timeout_var.get())
+        except ValueError:
+            messagebox.showerror("Input Error", "Interval and timeout must be numeric values.")
+            return
+
+        try:
+            _ = pytesseract.get_tesseract_version()
+        except TesseractNotFoundError:
+            messagebox.showerror("Missing Dependency", "Tesseract binary not found. Install Tesseract OCR.")
+            return
+
+        self.runner = OCRRunner(
+            source=self.source_var.get(),
+            api_url=self.api_var.get(),
+            rois=self.rois,
+            interval=max(0.02, interval),
+            http_timeout=max(0.05, timeout),
+            on_update=self._on_update,
+            on_status=self._set_status,
+        )
+        self.runner.start()
+        self._set_status("Starting OCR...")
+
+    def _stop(self) -> None:
+        if self.runner is None:
+            return
+        self.runner.stop()
+        self.runner = None
+        self._set_status("Stopped")
+
+    def run(self) -> None:
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.mainloop()
+
+    def _on_close(self) -> None:
+        self._stop()
+        self.root.destroy()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="OCR basketball scoreboard and push /api/state updates")
-    parser.add_argument("--source", default="0", help="Video source: camera index (e.g. 0), video file, or image")
-    parser.add_argument("--api", default="http://localhost:3000/api/state", help="Scoreboard API endpoint")
-    parser.add_argument("--config", type=Path, help="Path to JSON config with normalized rois")
-    parser.add_argument("--interval", type=float, default=0.15, help="Seconds between OCR reads")
-    parser.add_argument("--http-timeout", type=float, default=0.25, help="POST timeout in seconds")
-    parser.add_argument("--debug", action="store_true", help="Print extracted fields each iteration")
-    parser.add_argument(
-        "--roi-gui",
-        action="store_true",
-        help="Open interactive GUI to draw/select ROIs and save a config JSON",
-    )
-    parser.add_argument(
-        "--roi-output",
-        type=Path,
-        default=Path("config.generated.json"),
-        help="Output JSON path for --roi-gui mode",
-    )
-    args = parser.parse_args()
-
-    cfg = load_config(args.config)
-    rois = cfg.get("rois", DEFAULT_ROIS)
-
-    if args.roi_gui:
-        return run_roi_gui(args.source, args.roi_output, rois)
-
     try:
-        _ = pytesseract.get_tesseract_version()
-    except TesseractNotFoundError:
-        print("tesseract binary not found. Install Tesseract OCR and ensure it is on PATH.", file=sys.stderr)
-        return 3
-
-    source_path = Path(args.source)
-    if source_path.exists() and source_path.suffix.lower() in IMAGE_SUFFIXES:
-        frame = cv2.imread(str(source_path))
-        if frame is None:
-            print("Failed to read image", file=sys.stderr)
-            return 1
-        state = extract_state(frame, rois)
-        if args.debug:
-            print(state)
-        if state:
-            post_json(args.api, state, args.http_timeout)
-        return 0
-
-    cap = create_capture(args.source)
-    if not cap.isOpened():
-        print(f"Unable to open source: {args.source}", file=sys.stderr)
+        app = ScoreboardOCRApp()
+    except tk.TclError as exc:
+        print(f"GUI could not start: {exc}", file=sys.stderr)
         return 2
-
-    last_sent: Dict[str, Any] = {}
-    next_run = 0.0
-
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                if source_path.exists():
-                    break
-                time.sleep(0.05)
-                continue
-
-            now = time.time()
-            if now < next_run:
-                continue
-            next_run = now + args.interval
-
-            extracted = extract_state(frame, rois)
-            changed = should_push(extracted, last_sent)
-            if args.debug and extracted:
-                print(extracted)
-            if changed:
-                post_json(args.api, changed, args.http_timeout)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        cap.release()
-
+    app.run()
     return 0
 
 

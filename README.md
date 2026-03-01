@@ -1,83 +1,43 @@
-# ScoreboardOCR
+# ScoreboardOCR (GUI App)
 
-Python OCR bridge for [RoboWhisperer/BasketballScoreboard](https://github.com/RoboWhisperer/BasketballScoreboard).
+Desktop GUI OCR tool for [RoboWhisperer/BasketballScoreboard](https://github.com/RoboWhisperer/BasketballScoreboard).
 
-This program reads scoreboard values from a camera/video/image and pushes recognized fields to the scoreboard app API (`POST /api/state`).
+This project is now **GUI-first** so all configuration is done in the application window (no runtime CLI usage required).
 
-## Features
+## What the app does
 
-- Compatible with BasketballScoreboard state fields:
-  - `homeScore`, `awayScore`
-  - `gameClock` (`MM:SS`)
-  - `shotClock`
-  - `period` (`Q1`-`Q4`, `OT`, `2OT`)
-  - `homeFouls`, `awayFouls`
-  - `homeTimeouts`, `awayTimeouts`
-- **Interactive ROI GUI** to draw boxes for each field and export JSON config.
-- Delta updates only: only changed fields are POSTed.
-- Supports camera index, video file, and single image mode.
+- Reads a camera/video/image source.
+- Uses OCR to detect scoreboard values.
+- Sends recognized field updates to BasketballScoreboard API (`/api/state`).
+- Lets you graphically configure ROIs (drawing boxes for each field).
 
-## Requirements
+Supported fields:
+- `homeScore`, `awayScore`
+- `gameClock` (`MM:SS`)
+- `shotClock`
+- `period` (`Q1`-`Q4`, `OT`, `2OT`)
+- `homeFouls`, `awayFouls`
+- `homeTimeouts`, `awayTimeouts`
 
-- Python 3.10+
-- Tesseract OCR installed on your machine (binary `tesseract` must be available)
-- Python packages:
+## GUI workflow
 
-```bash
-pip install -r requirements.txt
-```
+1. Open the `ScoreboardOCR` app executable.
+2. Set the source in the GUI:
+   - camera index (for example `0`), or
+   - video/image file path.
+3. Set the API URL (default is `http://localhost:3000/api/state`).
+4. Click **Edit ROIs** and draw boxes for each field.
+5. Save ROI config in the GUI.
+6. Click **Start OCR**.
+7. Watch recognized updates in the live log panel.
 
-## Quick start
+## Executable packaging
 
-1) Create/tune ROIs with GUI:
+The repository includes a GUI executable build script (`build_exe.py`) configured for PyInstaller one-file windowed output.
 
-```bash
-python ocr_scoreboard.py --source ./frame_or_video.mp4 --roi-gui --roi-output ./config.generated.json
-```
+Build output is generated in the `dist` directory as `ScoreboardOCR.exe` on Windows.
 
-Notes:
-- If `--source` is a camera/video, the GUI uses the first readable frame.
-- Draw a rectangle per field, switch fields in dropdown, then click **Save**.
+## Dependency note
 
-2) Run OCR and push updates to BasketballScoreboard API:
-
-```bash
-python ocr_scoreboard.py --source 0 --api http://localhost:3000/api/state --config ./config.generated.json --debug
-```
-
-## Usage examples
-
-### Camera source
-
-```bash
-python ocr_scoreboard.py --source 0 --api http://localhost:3000/api/state --config ./config.example.json
-```
-
-### Video file source
-
-```bash
-python ocr_scoreboard.py --source ./game_feed.mp4 --config ./config.example.json --interval 0.2
-```
-
-### Single image source
-
-```bash
-python ocr_scoreboard.py --source ./frame.png --config ./config.example.json --debug
-```
-
-## ROI configuration format
-
-ROIs are normalized fractions:
-
-```json
-"field": [x, y, width, height]
-```
-
-All values are relative to frame size (0.0-1.0).
-
-## Notes
-
-- `--interval` controls OCR rate (default `0.15s`).
-- `--http-timeout` controls POST timeout (default `0.25s`).
-- On network/API errors, the script keeps running and retries on next update.
-- `--roi-gui` mode does **not** require Tesseract installed; OCR mode does.
+- Tesseract OCR must still be installed on the machine running the app.
+- The app checks for Tesseract when OCR is started and shows a GUI error if missing.
