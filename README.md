@@ -41,3 +41,7 @@ Build output is generated in the `dist` directory as `ScoreboardOCR.exe` on Wind
 
 - Tesseract OCR must still be installed on the machine running the app.
 - The app checks for Tesseract when OCR is started and shows a GUI error if missing.
+## Build guide
+
+For step-by-step Windows executable packaging instructions, see [BUILDING_EXE.md](./BUILDING_EXE.md).
+
